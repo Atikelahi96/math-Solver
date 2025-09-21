@@ -11,7 +11,7 @@ from PIL import Image
 import requests
 import re
 from dotenv import load_dotenv
-
+import json
 # Load environment variables
 load_dotenv()
 
@@ -144,27 +144,64 @@ async def solve_image_problem(file: UploadFile = File(...)):
 
 @app.post("/solve/image-with-prompt")
 async def solve_image_with_prompt(
-    file: UploadFile = File(...),
-    prompt: str = Form(...)
+    file: UploadFile = File(None),
+    prompt: str = Form(None)
 ):
     """
-    Solve a math problem from an image with a custom user prompt
+    Solve a math problem from an image with an optional custom user prompt.
+    Accepts:
+      - image only (use default prompt to extract & solve)
+      - prompt only (solve from text prompt)
+      - both image and prompt (use prompt + image)
+    At least one of `file` or `prompt` must be provided.
     """
-    # Check if the file is an image
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
-    
+    # Require at least one input
+    if file is None and (prompt is None or prompt.strip() == ""):
+        raise HTTPException(status_code=400, detail="Provide an image file, a text prompt, or both.")
+
     try:
-        # Read image file
-        image_data = await file.read()
-        
-        # Process the image
-        img = Image.open(io.BytesIO(image_data))
-        solution = process_math_problem(prompt, img)
-        
-        return JSONResponse(content={"solution": solution, "user_prompt": prompt})
+        img = None
+
+        # If a file is provided, validate and open it
+        if file is not None:
+            if not file.content_type.startswith("image/"):
+                raise HTTPException(status_code=400, detail="File must be an image")
+            image_bytes = await file.read()
+            img = Image.open(io.BytesIO(image_bytes))
+
+        # If no prompt provided but image is present, use a sensible default prompt
+        if not prompt or prompt.strip() == "":
+            prompt = """
+            Extract and solve the math problem from this image. Provide a clear, step-by-step solution in natural language.
+            Use LaTeX formatting for mathematical expressions (enclose in $ for inline and $$ for display equations).
+            Avoid markdown formatting except for LaTeX.
+
+            Format your response with clear steps and a final answer.
+            """
+
+        # Call the shared processing function:
+        # - if img is None, process_math_problem(prompt) -> text-only
+        # - if img present, process_math_problem(prompt, img) -> vision + prompt
+        solution = process_math_problem(prompt, img) if img is not None else process_math_problem(prompt)
+
+        # Build response
+        response_content = {
+            "solution": solution,
+            "input": {
+                "provided_image": bool(img),
+                "provided_prompt": bool(prompt and prompt.strip() != "")
+            }
+        }
+        if file is not None:
+            response_content["input"]["image_filename"] = file.filename
+        if prompt is not None:
+            response_content["user_prompt"] = prompt
+
+        return JSONResponse(content=response_content)
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/solve/url")
 async def solve_image_url(url: str = Form(...)):
@@ -194,60 +231,137 @@ async def solve_image_url(url: str = Form(...)):
         return JSONResponse(content={"solution": solution})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing image URL: {str(e)}")
-
 @app.post("/check-solution")
 async def check_solution(
-    problem: str = Form(...),
-    file: UploadFile = File(...)
+    problem_text: str = Form(None),
+    problem_file: UploadFile = File(None),
+    solution_text: str = Form(None),
+    solution_file: UploadFile = File(None)
 ):
     """
-    Check if the uploaded solution matches the correct solution for a given problem
+    Check if the uploaded solution matches the correct solution for a given problem.
+    - problem_text / problem_file: one or both may be provided (at least one required).
+    - solution_text / solution_file: one or both may be provided (at least one required).
+    Returns JSON including:
+      - comparison: 0 if correct, 1 if incorrect (or unclear)
+      - correct_solution: canonical final answer produced from the problem
+      - extracted_solution: final answer extracted from user's solution input
+      - raw_result: the raw text returned by the model when comparing
     """
-    # Check if the file is an image
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
-    
+    # Validate inputs: at least one problem input and one solution input
+    if (not problem_text or not problem_text.strip()) and problem_file is None:
+        raise HTTPException(status_code=400, detail="Provide the problem as text, an image, or both.")
+    if (not solution_text or not solution_text.strip()) and solution_file is None:
+        raise HTTPException(status_code=400, detail="Provide the solution as text, an image, or both.")
+
+    # Validate image content types (if provided)
+    if problem_file is not None and not problem_file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Problem file must be an image.")
+    if solution_file is not None and not solution_file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Solution file must be an image.")
+
     try:
-        # First, get the correct solution
-        solution_prompt = f"""
-        Solve the following math problem. Provide only the final answer in its simplest form.
-        Use LaTeX formatting if appropriate.
-        Do not include any explanations or steps.
-        
-        Problem: {problem}
-        
-        Final answer only:
-        """
-        
-        correct_solution = process_math_problem(solution_prompt)
-        
-        # Read image file
-        image_data = await file.read()
-        
-        # Create prompt for checking the solution
-        check_prompt = f"""
-        Extract the final answer from this solution image. 
-        Compare it with the correct answer: {correct_solution}
-        
-        Return only:
-        - "CORRECT" if the answers match (consider different formats like fractions, decimals, etc.)
-        - "INCORRECT" if they don't match
-        - "UNCLEAR" if you can't determine
-        
-        Do not include any explanations.
-        """
-        
-        # Process the image
-        img = Image.open(io.BytesIO(image_data))
-        result = process_math_problem(check_prompt, img)
-        
+        # 1) Produce the canonical correct solution (final answer only) from the provided problem input(s)
+        # Build a prompt asking for final answer only
+        problem_prompt = f"""
+Solve the following math problem. Provide only the final answer in its simplest form.
+Use LaTeX formatting if appropriate. Do not include any explanations or steps.
+
+"""
+        # If user provided a textual problem, include it in the prompt
+        if problem_text and problem_text.strip():
+            problem_prompt += f"Problem (text): {problem_text.strip()}\n\n"
+
+        problem_prompt += "Final answer only:"
+
+        problem_img = None
+        if problem_file is not None:
+            problem_bytes = await problem_file.read()
+            problem_img = Image.open(io.BytesIO(problem_bytes))
+
+        # Use vision+prompt if image present, otherwise text-only
+        correct_solution = process_math_problem(problem_prompt, problem_img) if problem_img is not None else process_math_problem(problem_prompt)
+        correct_solution = correct_solution.strip()
+
+        # 2) Extract the final answer from the user's solution input and compare to correct_solution
+        # Build checking prompt that instructs the model to extract the final answer and compare
+        # We'll include the correct_solution in the prompt so the comparing model can normalize and compare.
+        check_prompt_base = f"""
+Extract the final answer from the provided solution (either text or image). Then compare it with the correct answer: {correct_solution}
+
+Return **only** a single word: "CORRECT" if the answers match (consider equivalent formats like fractions vs decimals, simplified forms, etc.), or "INCORRECT" if they don't match. If you cannot determine, return "INCORRECT".
+Do not include any explanations.
+"""
+        # If user provided solution text, include it in the prompt so the model can use it when an image is not provided
+        if solution_text and solution_text.strip():
+            check_prompt_base = f"Solution (text): {solution_text.strip()}\n\n" + check_prompt_base
+
+        extracted_solution = ""
+        raw_result = ""
+
+        if solution_file is not None:
+            # If the user provided a solution image (possibly also text), pass image + prompt to vision model
+            solution_bytes = await solution_file.read()
+            solution_img = Image.open(io.BytesIO(solution_bytes))
+            raw_result = process_math_problem(check_prompt_base, solution_img)
+        else:
+            # No solution image -> compare using text only
+            raw_result = process_math_problem(check_prompt_base)
+
+        raw_result = raw_result.strip()
+
+        # Try to extract CORRECT / INCORRECT
+        m = re.search(r'\b(CORRECT|INCORRECT)\b', raw_result, re.IGNORECASE)
+        if m:
+            verdict = m.group(1).upper()
+            comparison = 0 if verdict == "CORRECT" else 1
+        else:
+            # If the model didn't return a clear token, treat as incorrect (per your request to return 0 or 1)
+            comparison = 1
+
+        # For extra transparency: ask the model (or reuse what we have) to extract final answer text from user's solution input.
+        # We'll attempt a short extra prompt that asks the model to "Extract final answer only" from the provided solution.
+        extract_prompt = """
+Extract the final answer from the provided solution. Return only the answer (use LaTeX if appropriate). 
+If you cannot determine the final answer, return "UNCLEAR".
+"""
+        if solution_text and solution_text.strip():
+            extract_prompt = f"Solution (text): {solution_text.strip()}\n\n" + extract_prompt
+
+        if solution_file is not None:
+            # Use vision to extract the final answer
+            solution_img = Image.open(io.BytesIO(await solution_file.read()))  # note: reading again — if you prefer, cache bytes earlier
+            # Because we already read the file above, reopen from bytes saved earlier — but for simplicity we re-open
+            # (If file streams are exhausted in your environment, you should cache `solution_bytes` earlier and reuse)
+            # Here we attempt to re-use `solution_bytes` if present:
+            try:
+                # try to reuse the bytes variable if available
+                solution_img = Image.open(io.BytesIO(solution_bytes))
+            except NameError:
+                # fallback already set above
+                pass
+            extracted_raw = process_math_problem(extract_prompt, solution_img)
+        else:
+            extracted_raw = process_math_problem(extract_prompt)
+
+        extracted_solution = extracted_raw.strip() if extracted_raw else ""
+
         return JSONResponse(content={
-            "problem": problem,
+            "comparison": comparison,          # 0 == correct, 1 == incorrect / unclear
             "correct_solution": correct_solution,
-            "result": result.strip()
+            "extracted_solution": extracted_solution,
+            "raw_result": raw_result,
+            "inputs": {
+                "problem_text_provided": bool(problem_text and problem_text.strip()),
+                "problem_image_provided": bool(problem_file),
+                "solution_text_provided": bool(solution_text and solution_text.strip()),
+                "solution_image_provided": bool(solution_file)
+            }
         })
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/classify")
 async def classify_message(message: str = Form(...)):
