@@ -52,21 +52,35 @@ classification_model = genai.GenerativeModel(
 
 def process_math_problem(prompt: str, image_data=None):
     """
-    Process a math problem using Gemini API with natural output formatting
+    Process a math problem using Gemini API.
+    Accepts:
+      - image_data: either a PIL.Image.Image OR raw bytes (will be converted to PIL.Image)
+      - or None for text-only prompts
+    Returns the model's text response (stripped).
     """
     try:
         if image_data:
-            # For vision tasks, we need to use the correct model
+            # If bytes were passed, convert to PIL Image
+            if isinstance(image_data, (bytes, bytearray)):
+                img = Image.open(io.BytesIO(image_data))
+            elif isinstance(image_data, Image.Image):
+                img = image_data
+            else:
+                # If it's some other wrapper from SDK, try to use it directly
+                img = image_data
+
+            # Use the vision-capable model and pass the PIL Image object
             vision_model = genai.GenerativeModel('gemini-2.5-pro')
-            response = vision_model.generate_content([prompt, image_data])
+            response = vision_model.generate_content([prompt, img])
         else:
-            # Process text with Gemini Pro
+            # Text-only
             response = text_model.generate_content(prompt)
-        
-        # Return the raw response without excessive formatting
+
         return response.text.strip()
     except Exception as e:
+        # Keep the HTTPException so FastAPI returns 500 with the error
         raise HTTPException(status_code=500, detail=f"Error processing with Gemini: {str(e)}")
+
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -261,85 +275,83 @@ async def check_solution(
         raise HTTPException(status_code=400, detail="Solution file must be an image.")
 
     try:
-        # 1) Produce the canonical correct solution (final answer only) from the provided problem input(s)
-        # Build a prompt asking for final answer only
-        problem_prompt = f"""
+        # --- Read and cache file bytes once (if provided), convert to PIL.Image ---
+        problem_bytes = None
+        problem_img = None
+        if problem_file is not None:
+            problem_bytes = await problem_file.read()
+            try:
+                # convert to RGB to avoid mode-related issues and validate
+                problem_img = Image.open(io.BytesIO(problem_bytes)).convert("RGB")
+                problem_img.load()
+            except Exception:
+                raise HTTPException(status_code=400, detail="Could not open problem image. Ensure it's a valid image file.")
+
+        solution_bytes = None
+        solution_img = None
+        if solution_file is not None:
+            solution_bytes = await solution_file.read()
+            try:
+                solution_img = Image.open(io.BytesIO(solution_bytes)).convert("RGB")
+                solution_img.load()
+            except Exception:
+                raise HTTPException(status_code=400, detail="Could not open solution image. Ensure it's a valid image file.")
+
+        # --- 1) Produce the canonical correct solution (final answer only) ---
+        problem_prompt = """
 Solve the following math problem. Provide only the final answer in its simplest form.
 Use LaTeX formatting if appropriate. Do not include any explanations or steps.
 
 """
-        # If user provided a textual problem, include it in the prompt
         if problem_text and problem_text.strip():
             problem_prompt += f"Problem (text): {problem_text.strip()}\n\n"
-
         problem_prompt += "Final answer only:"
 
-        problem_img = None
-        if problem_file is not None:
-            problem_bytes = await problem_file.read()
-            problem_img = Image.open(io.BytesIO(problem_bytes))
+        # Pass the PIL.Image object (if present) — do NOT pass raw bytes to the SDK
+        if problem_img is not None:
+            correct_solution = process_math_problem(problem_prompt, problem_img)
+        else:
+            correct_solution = process_math_problem(problem_prompt)
 
-        # Use vision+prompt if image present, otherwise text-only
-        correct_solution = process_math_problem(problem_prompt, problem_img) if problem_img is not None else process_math_problem(problem_prompt)
         correct_solution = correct_solution.strip()
 
-        # 2) Extract the final answer from the user's solution input and compare to correct_solution
-        # Build checking prompt that instructs the model to extract the final answer and compare
-        # We'll include the correct_solution in the prompt so the comparing model can normalize and compare.
+        # --- 2) Compare user's provided solution with canonical correct_solution ---
         check_prompt_base = f"""
 Extract the final answer from the provided solution (either text or image). Then compare it with the correct answer: {correct_solution}
 
-Return **only** a single word: "CORRECT" if the answers match (consider equivalent formats like fractions vs decimals, simplified forms, etc.), or "INCORRECT" if they don't match. If you cannot determine, return "INCORRECT".
+Return ONLY a single word: CORRECT (if the answers match, considering equivalent formats like fractions vs decimals) or INCORRECT (if they don't match).
+If you cannot determine, return INCORRECT.
 Do not include any explanations.
 """
-        # If user provided solution text, include it in the prompt so the model can use it when an image is not provided
+        # If user provided solution text, include it
         if solution_text and solution_text.strip():
             check_prompt_base = f"Solution (text): {solution_text.strip()}\n\n" + check_prompt_base
 
-        extracted_solution = ""
-        raw_result = ""
-
-        if solution_file is not None:
-            # If the user provided a solution image (possibly also text), pass image + prompt to vision model
-            solution_bytes = await solution_file.read()
-            solution_img = Image.open(io.BytesIO(solution_bytes))
+        # Run the comparison: pass PIL.Image if available
+        if solution_img is not None:
             raw_result = process_math_problem(check_prompt_base, solution_img)
         else:
-            # No solution image -> compare using text only
             raw_result = process_math_problem(check_prompt_base)
 
         raw_result = raw_result.strip()
 
-        # Try to extract CORRECT / INCORRECT
+        # Determine verdict
         m = re.search(r'\b(CORRECT|INCORRECT)\b', raw_result, re.IGNORECASE)
         if m:
             verdict = m.group(1).upper()
             comparison = 0 if verdict == "CORRECT" else 1
         else:
-            # If the model didn't return a clear token, treat as incorrect (per your request to return 0 or 1)
-            comparison = 1
+            comparison = 1  # treat unclear as incorrect per your requirement
 
-        # For extra transparency: ask the model (or reuse what we have) to extract final answer text from user's solution input.
-        # We'll attempt a short extra prompt that asks the model to "Extract final answer only" from the provided solution.
+        # --- 3) Extract final answer from user's solution for transparency (reuse PIL.Image) ---
         extract_prompt = """
-Extract the final answer from the provided solution. Return only the answer (use LaTeX if appropriate). 
+Extract the final answer from the provided solution. Return only the answer (use LaTeX if appropriate).
 If you cannot determine the final answer, return "UNCLEAR".
 """
         if solution_text and solution_text.strip():
             extract_prompt = f"Solution (text): {solution_text.strip()}\n\n" + extract_prompt
 
-        if solution_file is not None:
-            # Use vision to extract the final answer
-            solution_img = Image.open(io.BytesIO(await solution_file.read()))  # note: reading again — if you prefer, cache bytes earlier
-            # Because we already read the file above, reopen from bytes saved earlier — but for simplicity we re-open
-            # (If file streams are exhausted in your environment, you should cache `solution_bytes` earlier and reuse)
-            # Here we attempt to re-use `solution_bytes` if present:
-            try:
-                # try to reuse the bytes variable if available
-                solution_img = Image.open(io.BytesIO(solution_bytes))
-            except NameError:
-                # fallback already set above
-                pass
+        if solution_img is not None:
             extracted_raw = process_math_problem(extract_prompt, solution_img)
         else:
             extracted_raw = process_math_problem(extract_prompt)
@@ -359,8 +371,12 @@ If you cannot determine the final answer, return "UNCLEAR".
             }
         })
 
+    except HTTPException:
+        # re-raise FastAPI HTTPExceptions
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.post("/classify")

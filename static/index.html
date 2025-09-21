@@ -612,7 +612,7 @@
             <p>Enhanced with LaTeX rendering and smart image processing</p>
             <div class="developer-badge">
                 <i class="bi bi-code-slash"></i>
-                Developed by Mizanur Rahman
+                Developed by MR ATIK
             </div>
         </div>
     </header>
@@ -1245,7 +1245,7 @@
             }
         }
 
-        // FIXED: Check solution with validation for flexible inputs
+        // FIXED: Check solution with correct form field names matching backend
         async function checkSolution() {
             const problemText = document.getElementById('checkProblemText').value?.trim();
             const problemFileInput = document.getElementById('problemImageFile');
@@ -1273,7 +1273,7 @@
             
             const formData = new FormData();
             
-            // Add problem inputs
+            // Add problem inputs with exact field names expected by backend
             if (problemText) {
                 formData.append('problem_text', problemText);
             }
@@ -1281,13 +1281,21 @@
                 formData.append('problem_file', problemFile);
             }
             
-            // Add solution inputs
+            // Add solution inputs with exact field names expected by backend
             if (solutionText) {
                 formData.append('solution_text', solutionText);
             }
             if (solutionFile) {
                 formData.append('solution_file', solutionFile);
             }
+            
+            // Debug logging
+            console.log('Sending data:', {
+                problem_text: problemText || 'not provided',
+                problem_file: problemFile ? 'file provided' : 'not provided',
+                solution_text: solutionText || 'not provided', 
+                solution_file: solutionFile ? 'file provided' : 'not provided'
+            });
             
             try {
                 const response = await fetch(`${API_URL}/check-solution`, { 
@@ -1296,10 +1304,13 @@
                 });
                 
                 if (!response.ok) {
+                    const errorText = await response.text();
+                    console.error('Server response:', errorText);
                     throw new Error(`Server error: ${response.status} - ${response.statusText}`);
                 }
                 
                 const data = await response.json();
+                console.log('Response data:', data);
                 
                 let resultClass = 'alert-warning';
                 let icon = 'bi-question-circle';
@@ -1355,6 +1366,9 @@
                     solutionInputDisplay += `</div>`;
                 }
                 
+                const formattedCorrectSolution = formatMathOutput(data.correct_solution || 'Solution not provided');
+                const formattedExtractedSolution = data.extracted_solution ? formatMathOutput(data.extracted_solution) : '';
+                
                 document.getElementById('resultDisplay').innerHTML = `
                     ${problemDisplay}
                     ${solutionInputDisplay}
@@ -1362,14 +1376,14 @@
                         <div class="result-header">
                             <i class="bi bi-lightbulb"></i>Correct Solution:
                         </div>
-                        <p>${data.correct_solution || 'Solution not provided'}</p>
+                        <div class="math-output">${formattedCorrectSolution}</div>
                     </div>
                     ${data.extracted_solution ? `
                     <div class="problem-display">
                         <div class="result-header">
                             <i class="bi bi-search"></i>Extracted from Your Solution:
                         </div>
-                        <p>${data.extracted_solution}</p>
+                        <div class="math-output">${formattedExtractedSolution}</div>
                     </div>
                     ` : ''}
                     <div class="alert ${resultClass}">
@@ -1385,6 +1399,12 @@
                         </div>
                     </div>
                 `;
+                
+                // Re-render MathJax for LaTeX formatting
+                if (typeof MathJax !== 'undefined' && MathJax.typesetPromise) {
+                    MathJax.typesetPromise().catch(err => console.log('MathJax error:', err));
+                }
+                
             } catch (error) {
                 console.error('Solution checking error:', error);
                 displayError('resultDisplay', error);
